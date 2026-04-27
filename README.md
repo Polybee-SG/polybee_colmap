@@ -43,7 +43,7 @@ Building Python Wheels (polybee_colmap)
 ---------------------------------------
 
 Use the provided script to build `pycolmap` wheels for Python 3.12 against
-CUDA 13.0 and CUDA 12.8 in a single command:
+CUDA 13.0:
 
 ```bash
 ./scripts/shell/build_wheels_python312.sh [CUDA_ARCH]
