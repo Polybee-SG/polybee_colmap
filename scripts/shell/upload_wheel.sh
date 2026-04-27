@@ -41,8 +41,10 @@ done
 
 # ── Check dependencies ─────────────────────────────────────────────────────
 if ! command -v twine &>/dev/null; then
-  echo "twine not found — installing..."
-  pip install --quiet twine
+  echo "Error: twine is not installed."
+  echo "Install it first, for example in your virtualenv:"
+  echo "  python -m pip install twine"
+  exit 1
 fi
 
 if ! command -v aws &>/dev/null; then
