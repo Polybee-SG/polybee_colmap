@@ -2,9 +2,10 @@
 # Build pycolmap wheels for Python 3.12 against CUDA 13.0 and CUDA 12.8.
 #
 # Each CUDA variant gets its own COLMAP C++ build + install tree, then a
-# separate Python wheel.  Output wheels land in polybee_colmap/dist/ and are
-# renamed to include the CUDA version, e.g.:
-#   pycolmap-4.1.0.dev0-cp312-cp312-linux_x86_64-cuda13.0.whl
+# separate Python wheel.  The CUDA version is embedded in both the wheel
+# filename and the package metadata version (PEP 440 local segment), e.g.:
+#   pycolmap-4.1.0.dev0+cuda13.0-cp312-cp312-linux_x86_64.whl
+#   pip show pycolmap  →  Version: 4.1.0.dev0+cuda13.0
 #
 # Usage:
 #   ./scripts/shell/build_wheels_python312.sh [CUDA_ARCH]
@@ -15,10 +16,13 @@
 set -euo pipefail
 
 CUDA_ARCH="${1:-89}"
+# Set to empty string to let CMake auto-detect BLAS (e.g. on non-MKL machines).
+BLA_VENDOR="${BLA_VENDOR:-Intel10_64lp}"
 PYTHON="python3.12"
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "$SCRIPT_DIR/../.." && pwd)"
 DIST_DIR="$REPO_ROOT/dist"
+BASE_VERSION=$("$PYTHON" -c "import tomllib; d=tomllib.load(open('$REPO_ROOT/pyproject.toml','rb')); print(d['project']['version'])")
 
 mkdir -p "$DIST_DIR"
 
@@ -49,7 +53,7 @@ build_for_cuda() {
         -DCMAKE_INSTALL_PREFIX="$INSTALL_DIR" \
         -DCMAKE_CUDA_COMPILER="$NVCC_PATH" \
         -DCMAKE_CUDA_ARCHITECTURES="$CUDA_ARCH" \
-        -DBLA_VENDOR=Intel10_64lp
+        ${BLA_VENDOR:+-DBLA_VENDOR="$BLA_VENDOR"}
     ninja -j1 -C "$BUILD_DIR" install
 
     echo ""
@@ -63,20 +67,19 @@ build_for_cuda() {
 -Dcolmap_DIR=$INSTALL_DIR/share/colmap \
 -DCMAKE_CUDA_ARCHITECTURES=$CUDA_ARCH \
 -DCMAKE_CUDA_COMPILER=$NVCC_PATH" \
+    SKBUILD_BUILD_DIR="$REPO_ROOT/build/scikit-$CUDA_LABEL" \
+    SKBUILD_PROJECT_VERSION="${BASE_VERSION}+${CUDA_LABEL}" \
     LD_LIBRARY_PATH="$INSTALL_DIR/lib:${LD_LIBRARY_PATH:-}" \
     "$PYTHON" -m pip wheel \
         --no-deps \
         --wheel-dir "$WHEEL_BUILD_DIR" \
         "$REPO_ROOT"
 
-    # Rename the wheel to embed the CUDA version.
     local WHEEL
     WHEEL=$(ls "$WHEEL_BUILD_DIR"/*.whl | head -1)
-    local WHEEL_BASENAME
-    WHEEL_BASENAME="$(basename "$WHEEL" .whl)-$CUDA_LABEL.whl"
-    cp "$WHEEL" "$DIST_DIR/$WHEEL_BASENAME"
+    cp "$WHEEL" "$DIST_DIR/"
     echo ""
-    echo "Wheel written to: $DIST_DIR/$WHEEL_BASENAME"
+    echo "Wheel written to: $DIST_DIR/$(basename "$WHEEL")"
 }
 
 # ---------------------------------------------------------------------------

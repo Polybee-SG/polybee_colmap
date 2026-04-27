@@ -17,7 +17,7 @@ Usage: $0 <wheel_path>
 Upload a Python wheel to AWS CodeArtifact.
 
 Arguments:
-  wheel_path   Path to the .whl file (absolute or relative to this script)
+  wheel_path   Path to the .whl file (absolute or relative to the current working directory)
 
 Examples:
   $0 dist/pycolmap-4.1.0.dev0-cp312-cp312-linux_x86_64-cuda13.0.whl
