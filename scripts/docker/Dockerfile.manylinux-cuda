@@ -1,0 +1,91 @@
+# Build environment for compliant pycolmap manylinux_2_34_x86_64 wheels
+# with CUDA 13 support.
+#
+# Why this base:
+#   - Rocky Linux 9 has glibc 2.34, which is exactly the floor for
+#     manylinux_2_34_x86_64. A wheel built here can be loaded on any image
+#     with glibc >= 2.34 (RHEL/Rocky/Alma 9, Ubuntu 22.04+, Debian 12+, ...).
+#   - nvidia/cuda:<ver>-devel-rockylinux9 ships the full CUDA toolkit
+#     (nvcc, libcudart, libcublas, ...) which we need at build time.
+#
+# Anything bundled into the wheel by `auditwheel repair` MUST come from this
+# image (or be on $LD_LIBRARY_PATH at repair time). Anything excluded from
+# the wheel must instead be present on the consumer image — currently that's
+# only the CUDA runtime libs.
+FROM nvidia/cuda:13.0.0-devel-rockylinux9
+
+ENV LANG=C.UTF-8 \
+    PYTHONDONTWRITEBYTECODE=1 \
+    PYTHONUNBUFFERED=1
+
+# CRB ("CodeReady Builder", formerly PowerTools) hosts -devel packages for
+# headers like ceres-solver-devel, qt5-qtbase-devel, etc. EPEL adds CGAL,
+# flann, freeimage, glog, gflags, suitesparse, etc.
+RUN dnf install -y dnf-plugins-core epel-release \
+    && dnf config-manager --set-enabled crb \
+    && dnf clean all
+
+# Build toolchain.
+RUN dnf install -y \
+        gcc gcc-c++ make ninja-build cmake git patch \
+        wget curl tar bzip2 which file \
+        zlib-devel \
+        patchelf \
+    && dnf clean all
+
+# COLMAP system dependencies. Versions follow what EPEL 9 ships; if a future
+# COLMAP requires newer ceres or eigen, replace the relevant package with
+# a from-source build above the wheel build step.
+RUN dnf install -y \
+        boost-devel \
+        eigen3-devel \
+        suitesparse-devel \
+        flann-devel \
+        freeimage-devel \
+        glog-devel \
+        gflags-devel \
+        lz4-devel \
+        sqlite-devel \
+        cgal-devel gmp-devel mpfr-devel \
+        libcurl-devel openssl-devel \
+        mesa-libGL-devel mesa-libGLU-devel libglvnd-devel \
+        qt5-qtbase-devel qt5-qtbase-gui \
+        ceres-solver-devel \
+    && dnf clean all
+
+# Python 3.12 from AppStream + the wheel-building stack.
+RUN dnf install -y python3.12 python3.12-devel python3.12-pip \
+    && alternatives --install /usr/bin/python python /usr/bin/python3.12 100 \
+    && python3.12 -m pip install --no-cache-dir --upgrade \
+        pip \
+        "auditwheel>=6" \
+        "patchelf>=0.17" \
+        build \
+        wheel \
+    && dnf clean all
+
+# Intel oneAPI MKL — what BLA_VENDOR=Intel10_64lp links against in COLMAP.
+# We add Intel's RPM repo, install only the runtime + dev components needed
+# for linking, and leave the rest out to keep the image smaller.
+RUN tee /etc/yum.repos.d/oneAPI.repo >/dev/null <<'EOF'
+[oneAPI]
+name=Intel(R) oneAPI repository
+baseurl=https://yum.repos.intel.com/oneapi
+enabled=1
+gpgcheck=1
+repo_gpgcheck=1
+gpgkey=https://yum.repos.intel.com/intel-gpg-keys/GPG-PUB-KEY-INTEL-SW-PRODUCTS.PUB
+EOF
+
+RUN rpm --import https://yum.repos.intel.com/intel-gpg-keys/GPG-PUB-KEY-INTEL-SW-PRODUCTS.PUB \
+    && dnf install -y intel-oneapi-mkl-devel \
+    && dnf clean all
+
+# Make MKL discoverable to CMake's find_package(BLAS) / FindMKL and to the
+# dynamic loader during auditwheel repair.
+ENV MKLROOT=/opt/intel/oneapi/mkl/latest
+ENV LD_LIBRARY_PATH=${MKLROOT}/lib:/usr/local/cuda/lib64:${LD_LIBRARY_PATH:-}
+ENV LIBRARY_PATH=${MKLROOT}/lib
+ENV CMAKE_PREFIX_PATH=${MKLROOT}:${CMAKE_PREFIX_PATH:-}
+
+WORKDIR /work
