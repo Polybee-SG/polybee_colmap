@@ -42,8 +42,19 @@ Getting Started
 Building Python Wheels (polybee_colmap)
 ---------------------------------------
 
-Use the provided script to build `pycolmap` wheels for Python 3.12 against
-CUDA 13.0:
+The build produces a PEP 600-compliant `manylinux_2_34_x86_64` wheel that
+bundles every non-CUDA shared library it links against (COLMAP, MKL, ceres,
+suitesparse, glog, gflags, freeimage, OpenGL/Qt5, …). The CUDA runtime is
+deliberately *not* bundled — the consumer image is expected to provide it,
+e.g. `nvidia/cuda:13.0.x-runtime-*` or any image with CUDA 13 installed.
+
+### Requirements (host)
+
+- Docker (build runs inside a Rocky Linux 9 + CUDA 13 container)
+- About 8 GB of free disk for the build image and intermediate artefacts
+- A GPU is **not** required at build time — only at consumer install/runtime
+
+### Quick start
 
 ```bash
 ./scripts/shell/build_wheels_python312.sh [CUDA_ARCH]
@@ -52,29 +63,72 @@ CUDA 13.0:
 `CUDA_ARCH` is the numeric CUDA compute capability (default: `89` for
 Ada Lovelace / RTX 40xx). Common values:
 
-| GPU family       | CUDA_ARCH |
-|------------------|-----------|
-| Ada Lovelace (RTX 40xx) | 89 |
-| Ampere (RTX 30xx)       | 86 |
-| Turing (RTX 20xx)       | 75 |
+| GPU family              | CUDA_ARCH |
+|-------------------------|-----------|
+| Ada Lovelace (RTX 40xx) | 89        |
+| Ampere (RTX 30xx)       | 86        |
+| Turing (RTX 20xx)       | 75        |
 
-The script expects `nvcc` at:
-- `/usr/local/cuda-13.0/bin/nvcc`
-- `/usr/local/cuda-12.8/bin/nvcc`
+On the first run the script builds the `polybee-pycolmap-build:cuda13-py312`
+Docker image (~10 minutes — installs Rocky 9 + CUDA 13 toolkit + Python 3.12
++ Intel oneAPI MKL + COLMAP system deps). Subsequent runs reuse the cached
+image. Force a rebuild with `REBUILD_IMAGE=1 ./scripts/shell/build_wheels_python312.sh`.
 
-A CUDA version is silently skipped if its `nvcc` is not found.
+### Output
 
-Output wheels are written to `dist/` and named to include the CUDA version:
+The compliant wheel is written to `dist/` and tagged for `manylinux_2_34_x86_64`:
 
 ```
 dist/
-├── pycolmap-4.1.0.dev0-cp312-cp312-linux_x86_64-cuda13.0.whl
-└── pycolmap-4.1.0.dev0-cp312-cp312-linux_x86_64-cuda12.8.whl
+└── pycolmap-4.1.0.dev0+cuda13.0-cp312-cp312-manylinux_2_34_x86_64.whl
 ```
 
-Each wheel embeds a fully self-contained COLMAP build for its CUDA version.
-The intermediate C++ build trees are kept under `build/` and `install/` for
-incremental rebuilds.
+It pip-installs cleanly on any Linux image with glibc ≥ 2.34 (RHEL/Rocky/Alma
+9, Ubuntu 22.04+, Debian 12+, …) plus a matching CUDA runtime.
+
+### How it works
+
+| File                                             | Role |
+|--------------------------------------------------|------|
+| `scripts/docker/Dockerfile.manylinux-cuda`       | Defines the Rocky 9 + CUDA 13 + MKL + COLMAP-deps build image. |
+| `scripts/shell/build_wheels_python312.sh`        | Host orchestrator. Builds (or reuses) the image, then `docker run`s the inner script. |
+| `scripts/shell/_build_inside_container.sh`       | Runs inside the container: cmake → ninja → `pip wheel` → `auditwheel repair --plat manylinux_2_34_x86_64` with CUDA-only excludes. |
+
+Intermediate C++ build trees live under `/work` *inside the container* and
+do not pollute the host repo.
+
+### Configuration
+
+Environment overrides (all optional):
+
+| Variable          | Default                   | Purpose                                                                 |
+|-------------------|---------------------------|-------------------------------------------------------------------------|
+| `BLA_VENDOR`      | `Intel10_64lp`            | CMake `find_package(BLAS)` vendor. Set to `OpenBLAS` to skip MKL.       |
+| `MANYLINUX_PLAT`  | `manylinux_2_34_x86_64`   | `auditwheel` target tag. Lower it (e.g. `manylinux_2_28_x86_64`) only if you also rebuild the image on a matching glibc base. |
+| `IMAGE_TAG`       | `polybee-pycolmap-build:cuda13-py312` | Docker image name. |
+| `REBUILD_IMAGE`   | (unset)                   | Set to `1` to force `docker build` even if the image already exists.    |
+
+### Verifying the wheel
+
+After a build, the script prints the output of `auditwheel show`. Check that:
+
+- The platform tag is `manylinux_2_34_x86_64` (not `linux_x86_64`).
+- No CUDA library appears in `pycolmap.libs/` — only CUDA libs should remain
+  unbundled. If a CUDA lib was accidentally bundled, add its soname to the
+  `CUDA_EXCLUDES` array in `_build_inside_container.sh`.
+
+To smoke-test the wheel inside a clean container:
+
+```bash
+docker run --rm --gpus all \
+    -v "$PWD/dist:/dist:ro" \
+    nvidia/cuda:13.0.0-runtime-rockylinux9 \
+    bash -c '
+        dnf install -y python3.12 python3-pip > /dev/null 2>&1
+        python3.12 -m pip install /dist/pycolmap-*.whl
+        python3.12 -c "import pycolmap; print(pycolmap.__version__)"
+    '
+```
 
 Documentation
 -------------

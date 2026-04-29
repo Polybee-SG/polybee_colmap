@@ -19,8 +19,8 @@ ENV LANG=C.UTF-8 \
     PYTHONUNBUFFERED=1
 
 # CRB ("CodeReady Builder", formerly PowerTools) hosts -devel packages for
-# headers like ceres-solver-devel, qt5-qtbase-devel, etc. EPEL adds CGAL,
-# flann, freeimage, glog, gflags, suitesparse, etc.
+# headers like qt5-qtbase-devel, etc. EPEL adds CGAL, flann, freeimage,
+# gflags, suitesparse, etc.
 RUN dnf install -y dnf-plugins-core epel-release \
     && dnf config-manager --set-enabled crb \
     && dnf clean all
@@ -28,30 +28,68 @@ RUN dnf install -y dnf-plugins-core epel-release \
 # Build toolchain.
 RUN dnf install -y \
         gcc gcc-c++ make ninja-build cmake git patch \
-        wget curl tar bzip2 which file \
         zlib-devel \
         patchelf \
     && dnf clean all
 
-# COLMAP system dependencies. Versions follow what EPEL 9 ships; if a future
-# COLMAP requires newer ceres or eigen, replace the relevant package with
-# a from-source build above the wheel build step.
-RUN dnf install -y \
+# COLMAP system dependencies. EPEL 9 + CRB cover most of what COLMAP needs.
+# Notable exceptions built from source in later layers:
+#   - glog (EPEL ships 0.3.5 without glog-config.cmake; we need >= 0.6)
+#   - ceres-solver (not packaged for EPEL 9)
+#
+# `--allowerasing` lets `libcurl-devel` replace the preinstalled
+# `libcurl-minimal` (the two conflict on `libcurl.so`).
+RUN dnf install -y --allowerasing \
         boost-devel \
         eigen3-devel \
         suitesparse-devel \
         flann-devel \
         freeimage-devel \
-        glog-devel \
+        OpenImageIO-devel \
         gflags-devel \
         lz4-devel \
         sqlite-devel \
-        cgal-devel gmp-devel mpfr-devel \
+        CGAL-devel gmp-devel mpfr-devel \
         libcurl-devel openssl-devel \
         mesa-libGL-devel mesa-libGLU-devel libglvnd-devel \
+        glew-devel \
+        metis-devel \
         qt5-qtbase-devel qt5-qtbase-gui \
-        ceres-solver-devel \
     && dnf clean all
+
+# Build glog from source. EPEL 9's glog-devel is 0.3.5 and ships no
+# CMake config file, which forces find_package(Glog) into Module mode and
+# triggers a duplicate-target collision when Ceres's CeresConfig.cmake
+# transitively re-imports glog::glog. glog >= 0.6 installs glog-config.cmake,
+# which is idempotent. Building glog *before* Ceres also makes Ceres's
+# generated CeresConfig.cmake use modern Config-mode discovery for glog
+# instead of the legacy uppercase-variable logic.
+ARG GLOG_VERSION=0.6.0
+RUN cd /tmp \
+    && git clone --depth 1 --branch v${GLOG_VERSION} https://github.com/google/glog.git \
+    && cmake -S glog -B glog-build -GNinja \
+        -DCMAKE_BUILD_TYPE=Release \
+        -DCMAKE_INSTALL_PREFIX=/usr/local \
+        -DBUILD_SHARED_LIBS=ON \
+        -DBUILD_TESTING=OFF \
+        -DWITH_GTEST=OFF \
+    && ninja -C glog-build install \
+    && rm -rf /tmp/glog /tmp/glog-build
+
+# Build Ceres Solver from source (not in EPEL 9). Pinned to a known-good
+# release; bump alongside COLMAP when needed.
+ARG CERES_VERSION=2.2.0
+RUN cd /tmp \
+    && git clone --depth 1 --branch ${CERES_VERSION} https://github.com/ceres-solver/ceres-solver.git \
+    && cmake -S ceres-solver -B ceres-build -GNinja \
+        -DCMAKE_BUILD_TYPE=Release \
+        -DCMAKE_INSTALL_PREFIX=/usr/local \
+        -DBUILD_TESTING=OFF \
+        -DBUILD_EXAMPLES=OFF \
+        -DBUILD_BENCHMARKS=OFF \
+        -DUSE_CUDA=OFF \
+    && ninja -C ceres-build install \
+    && rm -rf /tmp/ceres-solver /tmp/ceres-build
 
 # Python 3.12 from AppStream + the wheel-building stack.
 RUN dnf install -y python3.12 python3.12-devel python3.12-pip \
@@ -77,15 +115,33 @@ repo_gpgcheck=1
 gpgkey=https://yum.repos.intel.com/intel-gpg-keys/GPG-PUB-KEY-INTEL-SW-PRODUCTS.PUB
 EOF
 
+# intel-oneapi-mkl-devel ships MKL itself; intel-oneapi-openmp ships
+# libiomp5.so, which CMake's FindBLAS link-tests for when
+# BLA_VENDOR=Intel10_64lp (threaded MKL). Without iomp5 the link test
+# fails and find_package(BLAS) reports BLAS_FOUND=FALSE, even though
+# the MKL libs are present.
 RUN rpm --import https://yum.repos.intel.com/intel-gpg-keys/GPG-PUB-KEY-INTEL-SW-PRODUCTS.PUB \
-    && dnf install -y intel-oneapi-mkl-devel \
+    && dnf install -y intel-oneapi-mkl-devel intel-oneapi-openmp \
     && dnf clean all
 
-# Make MKL discoverable to CMake's find_package(BLAS) / FindMKL and to the
-# dynamic loader during auditwheel repair.
+# Intel oneAPI 2024+ ships MKL libs under ${MKLROOT}/lib/, but CMake 3.26's
+# bundled FindBLAS module (and any consumer using find_package(BLAS) with
+# BLA_VENDOR=Intel10_64lp) still searches ${MKLROOT}/lib/intel64/. Create a
+# self-loop symlink so the legacy path resolves to the modern layout.
+# Without this, transitive find_package(BLAS) chains (e.g. inside Ceres's
+# CeresConfig.cmake → find_dependency(SuiteSparse) → find_package(BLAS))
+# fail, even though MKL is installed.
+RUN ln -sfn . /opt/intel/oneapi/mkl/latest/lib/intel64
+
+# Make MKL + Intel OpenMP discoverable to CMake's find_package(BLAS) (which
+# link-tests libmkl_intel_thread + libiomp5 when BLA_VENDOR=Intel10_64lp)
+# and to the dynamic loader at auditwheel-repair time. Note that libiomp5
+# lives under .../compiler/latest/lib, not under .../mkl/latest/lib — they
+# are separate Intel oneAPI components.
 ENV MKLROOT=/opt/intel/oneapi/mkl/latest
-ENV LD_LIBRARY_PATH=${MKLROOT}/lib:/usr/local/cuda/lib64:${LD_LIBRARY_PATH:-}
-ENV LIBRARY_PATH=${MKLROOT}/lib
-ENV CMAKE_PREFIX_PATH=${MKLROOT}:${CMAKE_PREFIX_PATH:-}
+ENV INTEL_COMPILER_RUNTIME=/opt/intel/oneapi/compiler/latest/lib
+ENV LD_LIBRARY_PATH=${MKLROOT}/lib:${INTEL_COMPILER_RUNTIME}:/usr/local/lib64:/usr/local/lib:/usr/local/cuda/lib64:${LD_LIBRARY_PATH:-}
+ENV LIBRARY_PATH=${MKLROOT}/lib:${INTEL_COMPILER_RUNTIME}
+ENV CMAKE_PREFIX_PATH=${MKLROOT}
 
 WORKDIR /work

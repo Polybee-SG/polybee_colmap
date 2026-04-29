@@ -1,6 +1,5 @@
 #!/bin/bash
-# Build manylinux_2_34_x86_64 pycolmap wheels for Python 3.12 with CUDA 13
-# (and optionally CUDA 12.8) support.
+# Build manylinux_2_34_x86_64 pycolmap wheels for Python 3.12 with CUDA 13.
 #
 # This script is a thin Docker orchestrator. The actual build runs inside a
 # Rocky Linux 9 + CUDA 13 container that matches manylinux_2_34's glibc
@@ -23,6 +22,7 @@
 #   MANYLINUX_PLAT    — auditwheel platform tag; default manylinux_2_34_x86_64
 #   IMAGE_TAG         — name of the build image; default polybee-pycolmap-build:cuda13-py312
 #   REBUILD_IMAGE=1   — force `docker build` even if the image already exists
+#   BUILD_JOBS        — override ninja parallelism (default: min(nproc, mem_gb/3))
 
 set -euo pipefail
 
@@ -74,6 +74,8 @@ docker run --rm \
     -e MANYLINUX_PLAT="$MANYLINUX_PLAT" \
     -e REPO_ROOT=/src \
     -e DIST_DIR=/dist \
+    -e HOST_UID="$(id -u)" \
+    -e HOST_GID="$(id -g)" \
     -v "$REPO_ROOT:/src" \
     -v "$DIST_DIR:/dist" \
     "$IMAGE_TAG" \

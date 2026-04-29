@@ -2,10 +2,10 @@
 set -euo pipefail
 
 # ── CodeArtifact configuration ─────────────────────────────────────────────
-DOMAIN=""           # e.g. my-domain
-DOMAIN_OWNER=""     # AWS account ID (12 digits)
+DOMAIN="polybee"           # e.g. my-domain
+DOMAIN_OWNER="732851294754"     # AWS account ID (12 digits)
 REPOSITORY="pycolmap"       # e.g. my-repo
-REGION=""           # e.g. us-east-1
+REGION="ap-southeast-1"           # e.g. us-east-1
 # ──────────────────────────────────────────────────────────────────────────
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"

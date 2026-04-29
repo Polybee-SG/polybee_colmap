@@ -14,6 +14,9 @@
 #   BLA_VENDOR      — CMake BLAS vendor (default Intel10_64lp / MKL)
 #   MANYLINUX_PLAT  — auditwheel target platform tag
 #                     (default manylinux_2_34_x86_64)
+#   BUILD_JOBS      — override ninja parallelism (default: min(nproc, mem_gb/3))
+#   HOST_UID/GID    — chown the produced wheels to this UID:GID before exit
+#                     so they don't appear root-owned on the host bind mount
 
 set -euo pipefail
 
@@ -28,6 +31,26 @@ DIST_DIR="${DIST_DIR:-/dist}"
 # source tree. Keeps the host repo clean and avoids permission issues from
 # Docker writing as root into a user-owned dir.
 WORK_ROOT="${WORK_ROOT:-/work}"
+
+# Pick a parallelism that won't OOM. Heavy templated TUs in COLMAP (notably
+# PoissonRecon.cpp) peak at ~3 GB per cc1plus invocation, so naively using
+# $(nproc) blows up RAM on machines with many cores and modest memory
+# (e.g. 22 cores / 15 GB). Cap jobs at min(nproc, mem_gb / 3). Override
+# with $BUILD_JOBS to force a specific value.
+if [ -n "${BUILD_JOBS:-}" ]; then
+    NJOBS="$BUILD_JOBS"
+else
+    NCPU=$(nproc)
+    MEM_GB=$(awk '/MemTotal/ {print int($2 / 1024 / 1024)}' /proc/meminfo)
+    MEM_JOBS=$(( MEM_GB / 3 ))
+    [ "$MEM_JOBS" -lt 1 ] && MEM_JOBS=1
+    if [ "$MEM_JOBS" -lt "$NCPU" ]; then
+        NJOBS="$MEM_JOBS"
+    else
+        NJOBS="$NCPU"
+    fi
+fi
+echo "Using NJOBS=$NJOBS (nproc=$(nproc), mem=$(awk '/MemTotal/ {print int($2/1024/1024)}' /proc/meminfo) GB)"
 
 mkdir -p "$DIST_DIR" "$WORK_ROOT"
 
@@ -93,14 +116,23 @@ build_for_cuda() {
     echo "========================================================"
     echo " [${CUDA_LABEL}] Building COLMAP C++"
     echo "========================================================"
+    # CMAKE_FIND_PACKAGE_PREFER_CONFIG=TRUE makes transitive find_package()
+    # calls (notably find_dependency(glog) inside CeresConfig.cmake) prefer
+    # *-config.cmake over Module-mode finders. Belt-and-suspenders: the image
+    # already builds glog from source so CeresConfig.cmake records modern
+    # Config-mode discovery, but this flag also protects COLMAP's own
+    # transitive dependency resolution from any future Module-mode finders
+    # that re-import the glog::glog target.
     cmake -S "$REPO_ROOT" -B "$CMAKE_BUILD_DIR" \
         -GNinja \
         -DCMAKE_BUILD_TYPE=Release \
         -DCMAKE_INSTALL_PREFIX="$INSTALL_DIR" \
         -DCMAKE_CUDA_COMPILER="$NVCC_PATH" \
         -DCMAKE_CUDA_ARCHITECTURES="$CUDA_ARCH" \
+        -DCMAKE_FIND_PACKAGE_PREFER_CONFIG=TRUE \
+        -DCMAKE_BUILD_WITH_INSTALL_RPATH=ON \
         ${BLA_VENDOR:+-DBLA_VENDOR="$BLA_VENDOR"}
-    ninja -j"$(nproc)" -C "$CMAKE_BUILD_DIR" install
+    ninja -j"$NJOBS" -C "$CMAKE_BUILD_DIR" install
 
     echo ""
     echo "========================================================"
@@ -109,10 +141,13 @@ build_for_cuda() {
     CMAKE_ARGS="\
 -Dcolmap_DIR=$INSTALL_DIR/share/colmap \
 -DCMAKE_CUDA_ARCHITECTURES=$CUDA_ARCH \
--DCMAKE_CUDA_COMPILER=$NVCC_PATH" \
+-DCMAKE_CUDA_COMPILER=$NVCC_PATH \
+-DCMAKE_FIND_PACKAGE_PREFER_CONFIG=TRUE \
+-DCMAKE_BUILD_WITH_INSTALL_RPATH=ON" \
     SKBUILD_BUILD_DIR="$STAGE_DIR/scikit" \
     SKBUILD_PROJECT_VERSION="${BASE_VERSION}+${CUDA_LABEL}" \
-    LD_LIBRARY_PATH="$INSTALL_DIR/lib:${LD_LIBRARY_PATH:-}" \
+    LD_LIBRARY_PATH="$INSTALL_DIR/lib64:$INSTALL_DIR/lib:/usr/local/lib64:/usr/local/lib:${LD_LIBRARY_PATH:-}" \
+    CMAKE_BUILD_PARALLEL_LEVEL="$NJOBS" \
     "$PYTHON" -m pip wheel \
         --no-deps \
         --wheel-dir "$WHEEL_DIR" \
@@ -132,7 +167,7 @@ build_for_cuda() {
         EXCLUDE_ARGS+=(--exclude "$lib")
     done
 
-    LD_LIBRARY_PATH="$INSTALL_DIR/lib:${LD_LIBRARY_PATH:-}" \
+    LD_LIBRARY_PATH="$INSTALL_DIR/lib64:$INSTALL_DIR/lib:/usr/local/lib64:/usr/local/lib:${LD_LIBRARY_PATH:-}" \
         "$PYTHON" -m auditwheel repair \
             --plat "$MANYLINUX_PLAT" \
             "${EXCLUDE_ARGS[@]}" \
@@ -152,7 +187,13 @@ build_for_cuda() {
 }
 
 build_for_cuda "13.0" "/usr/local/cuda-13.0/bin/nvcc"
-# build_for_cuda "12.8" "/usr/local/cuda-12.8/bin/nvcc"
+
+# Hand the produced wheels back to the host user. The container runs as root,
+# so anything it writes to the bind-mounted /dist appears root-owned on the
+# host. The orchestrator passes HOST_UID/HOST_GID; if absent, leave as-is.
+if [ -n "${HOST_UID:-}" ] && [ -n "${HOST_GID:-}" ]; then
+    chown -R "$HOST_UID:$HOST_GID" "$DIST_DIR"
+fi
 
 echo ""
 echo "========================================================"
