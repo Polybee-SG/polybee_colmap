@@ -134,6 +134,27 @@ build_for_cuda() {
         ${BLA_VENDOR:+-DBLA_VENDOR="$BLA_VENDOR"}
     ninja -j"$NJOBS" -C "$CMAKE_BUILD_DIR" install
 
+    # Recreate libonnxruntime SONAME symlinks. CMake's install(FILES) on the
+    # globbed onnxruntime libs (cmake/FindDependencies.cmake) dereferences
+    # symlinks, so $INSTALL_DIR/lib* ends up with the versioned regular file
+    # (libonnxruntime.so.X.Y.Z) and the bare alias, but NOT the SONAME
+    # (libonnxruntime.so.1) that pycolmap's _core.so DT_NEEDEDs. auditwheel
+    # resolves DT_NEEDED by literal filename on LD_LIBRARY_PATH, so without
+    # this symlink it silently skips bundling and the consumer image fails
+    # at `import pycolmap` with: libonnxruntime.so.1: cannot open shared
+    # object file. Same fix applies to libonnxruntime_providers_shared.so.
+    for libdir in "$INSTALL_DIR/lib64" "$INSTALL_DIR/lib"; do
+        [ -d "$libdir" ] || continue
+        for ort_full in "$libdir"/libonnxruntime*.so.[0-9]*.[0-9]*.[0-9]*; do
+            [ -e "$ort_full" ] || continue
+            soname=$(patchelf --print-soname "$ort_full" 2>/dev/null || true)
+            if [ -n "$soname" ] && [ ! -e "$libdir/$soname" ]; then
+                ln -sf "$(basename "$ort_full")" "$libdir/$soname"
+                echo "[onnx-soname] $libdir/$soname -> $(basename "$ort_full")"
+            fi
+        done
+    done
+
     echo ""
     echo "========================================================"
     echo " [${CUDA_LABEL}] Building pycolmap wheel"
