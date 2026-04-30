@@ -1,95 +1,88 @@
 #!/bin/bash
-# Build pycolmap wheels for Python 3.12 against CUDA 13.0 and CUDA 12.8.
+# Build manylinux_2_34_x86_64 pycolmap wheels for Python 3.12 with CUDA 13.
 #
-# Each CUDA variant gets its own COLMAP C++ build + install tree, then a
-# separate Python wheel.  The CUDA version is embedded in both the wheel
-# filename and the package metadata version (PEP 440 local segment), e.g.:
-#   pycolmap-4.1.0.dev0+cuda13.0-cp312-cp312-linux_x86_64.whl
-#   pip show pycolmap  →  Version: 4.1.0.dev0+cuda13.0
+# This script is a thin Docker orchestrator. The actual build runs inside a
+# Rocky Linux 9 + CUDA 13 container that matches manylinux_2_34's glibc
+# floor. Inside the container, COLMAP is built, the wheel is produced, and
+# `auditwheel repair` bundles every non-CUDA shared library it links against
+# (MKL, ceres, suitesparse, glog, gflags, freeimage, OpenGL/Qt5, …).
+#
+# Net result: a PEP 600-compliant wheel that pip-installs cleanly on any
+# Linux image with glibc >= 2.34 AND a matching CUDA runtime present
+# (e.g. nvidia/cuda:13.0.x-runtime-* or any image that has installed it).
 #
 # Usage:
 #   ./scripts/shell/build_wheels_python312.sh [CUDA_ARCH]
 #
-# CUDA_ARCH defaults to 89 (Ada Lovelace / RTX 40xx).
-# Override for other GPUs, e.g. 80 (Ampere), 86, 75 (Turing).
+#   CUDA_ARCH defaults to 89 (Ada Lovelace / RTX 40xx).
+#   Override for other GPUs, e.g. 80 (Ampere), 86, 75 (Turing).
+#
+# Optional environment overrides:
+#   BLA_VENDOR        — passed to CMake; default Intel10_64lp (MKL)
+#   MANYLINUX_PLAT    — auditwheel platform tag; default manylinux_2_34_x86_64
+#   IMAGE_TAG         — name of the build image; default polybee-pycolmap-build:cuda13-py312
+#   REBUILD_IMAGE=1   — force `docker build` even if the image already exists
+#   BUILD_JOBS        — override ninja parallelism (default: min(nproc, mem_gb/3))
 
 set -euo pipefail
 
 CUDA_ARCH="${1:-89}"
-# Set to empty string to let CMake auto-detect BLAS (e.g. on non-MKL machines).
 BLA_VENDOR="${BLA_VENDOR:-Intel10_64lp}"
-PYTHON="python3.12"
+MANYLINUX_PLAT="${MANYLINUX_PLAT:-manylinux_2_34_x86_64}"
+IMAGE_TAG="${IMAGE_TAG:-polybee-pycolmap-build:cuda13-py312}"
+
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "$SCRIPT_DIR/../.." && pwd)"
 DIST_DIR="$REPO_ROOT/dist"
-BASE_VERSION=$("$PYTHON" -c "import tomllib; d=tomllib.load(open('$REPO_ROOT/pyproject.toml','rb')); print(d['project']['version'])")
+DOCKERFILE="$REPO_ROOT/scripts/docker/Dockerfile.manylinux-cuda"
 
 mkdir -p "$DIST_DIR"
 
 # ---------------------------------------------------------------------------
-# Helper: build COLMAP C++ and then the Python wheel for one CUDA version.
+# 1. Build (or reuse) the manylinux+CUDA build image.
 # ---------------------------------------------------------------------------
-build_for_cuda() {
-    local CUDA_VERSION="$1"           # e.g. "13.0" or "12.8"
-    local NVCC_PATH="$2"              # e.g. /usr/local/cuda-13.0/bin/nvcc
-
-    if [ ! -x "$NVCC_PATH" ]; then
-        echo "[SKIP] nvcc not found at $NVCC_PATH — skipping CUDA $CUDA_VERSION"
-        return
-    fi
-
-    local CUDA_LABEL="cuda${CUDA_VERSION}"
-    local BUILD_DIR="$REPO_ROOT/build/$CUDA_LABEL"
-    local INSTALL_DIR="$REPO_ROOT/install/$CUDA_LABEL"
-
-    echo ""
+if [ "${REBUILD_IMAGE:-0}" = "1" ] || ! docker image inspect "$IMAGE_TAG" >/dev/null 2>&1; then
     echo "========================================================"
-    echo " Building COLMAP C++ for CUDA $CUDA_VERSION"
+    echo " Building Docker image: $IMAGE_TAG"
     echo "========================================================"
-    mkdir -p "$BUILD_DIR"
-    cmake -S "$REPO_ROOT" -B "$BUILD_DIR" \
-        -GNinja \
-        -DCMAKE_BUILD_TYPE=Release \
-        -DCMAKE_INSTALL_PREFIX="$INSTALL_DIR" \
-        -DCMAKE_CUDA_COMPILER="$NVCC_PATH" \
-        -DCMAKE_CUDA_ARCHITECTURES="$CUDA_ARCH" \
-        ${BLA_VENDOR:+-DBLA_VENDOR="$BLA_VENDOR"}
-    ninja -j1 -C "$BUILD_DIR" install
-
-    echo ""
-    echo "========================================================"
-    echo " Building pycolmap wheel for CUDA $CUDA_VERSION / Python 3.12"
-    echo "========================================================"
-    local WHEEL_BUILD_DIR="$REPO_ROOT/build/wheel-$CUDA_LABEL"
-    mkdir -p "$WHEEL_BUILD_DIR"
-
-    CMAKE_ARGS="\
--Dcolmap_DIR=$INSTALL_DIR/share/colmap \
--DCMAKE_CUDA_ARCHITECTURES=$CUDA_ARCH \
--DCMAKE_CUDA_COMPILER=$NVCC_PATH" \
-    SKBUILD_BUILD_DIR="$REPO_ROOT/build/scikit-$CUDA_LABEL" \
-    SKBUILD_PROJECT_VERSION="${BASE_VERSION}+${CUDA_LABEL}" \
-    LD_LIBRARY_PATH="$INSTALL_DIR/lib:${LD_LIBRARY_PATH:-}" \
-    "$PYTHON" -m pip wheel \
-        --no-deps \
-        --wheel-dir "$WHEEL_BUILD_DIR" \
-        "$REPO_ROOT"
-
-    local WHEEL
-    WHEEL=$(ls "$WHEEL_BUILD_DIR"/*.whl | head -1)
-    cp "$WHEEL" "$DIST_DIR/"
-    echo ""
-    echo "Wheel written to: $DIST_DIR/$(basename "$WHEEL")"
-}
+    docker build \
+        -f "$DOCKERFILE" \
+        -t "$IMAGE_TAG" \
+        "$(dirname "$DOCKERFILE")"
+else
+    echo "Reusing existing build image: $IMAGE_TAG  (set REBUILD_IMAGE=1 to force rebuild)"
+fi
 
 # ---------------------------------------------------------------------------
-# Build for each CUDA version.
+# 2. Run the actual build inside the container. We bind-mount the source
+#    read-write so SKBUILD can write its caches into the user's repo (which
+#    matches the pre-Docker behaviour); /dist receives the final wheel.
+#    --gpus is NOT required (the build links against CUDA libraries that
+#    exist purely in the toolkit; it does not execute GPU code), but is
+#    harmless if present.
 # ---------------------------------------------------------------------------
-build_for_cuda "13.0" "/usr/local/cuda-13.0/bin/nvcc"
-# build_for_cuda "12.8" "/usr/local/cuda-12.8/bin/nvcc"
+echo ""
+echo "========================================================"
+echo " Building wheel inside $IMAGE_TAG"
+echo "   CUDA_ARCH=$CUDA_ARCH"
+echo "   BLA_VENDOR=$BLA_VENDOR"
+echo "   MANYLINUX_PLAT=$MANYLINUX_PLAT"
+echo "========================================================"
+docker run --rm \
+    -e CUDA_ARCH="$CUDA_ARCH" \
+    -e BLA_VENDOR="$BLA_VENDOR" \
+    -e MANYLINUX_PLAT="$MANYLINUX_PLAT" \
+    -e REPO_ROOT=/src \
+    -e DIST_DIR=/dist \
+    -e HOST_UID="$(id -u)" \
+    -e HOST_GID="$(id -g)" \
+    -v "$REPO_ROOT:/src" \
+    -v "$DIST_DIR:/dist" \
+    "$IMAGE_TAG" \
+    /src/scripts/shell/_build_inside_container.sh
 
 echo ""
 echo "========================================================"
-echo " Done. Wheels in $DIST_DIR:"
+echo " Done. Compliant wheels in $DIST_DIR:"
 ls "$DIST_DIR"/*.whl 2>/dev/null || echo "  (none found)"
 echo "========================================================"
