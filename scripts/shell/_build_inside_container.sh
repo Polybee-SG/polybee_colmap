@@ -54,11 +54,17 @@ echo "Using NJOBS=$NJOBS (nproc=$(nproc), mem=$(awk '/MemTotal/ {print int($2/10
 
 mkdir -p "$DIST_DIR" "$WORK_ROOT"
 
-# CUDA libraries that must be excluded from the bundled wheel — they will
-# be provided by the consumer image's CUDA runtime. Auditwheel's --exclude
-# matches against the soname; we list common ones here. Add more if a
-# future COLMAP/CUDA version pulls in additional CUDA libs.
-CUDA_EXCLUDES=(
+# Libraries that must be excluded from the bundled wheel — they will be
+# provided by the consumer system. Auditwheel's --exclude matches against
+# the soname; --exclude leaves the DT_NEEDED entry intact so the runtime
+# loader resolves against the system copy (single instance, no TLS clash).
+#
+# CUDA: provided by the consumer image's CUDA runtime.
+# GL stack: provided by system libgl1/libglvnd. Bundling them produced a
+#   double-load conflict that previously required LD_PRELOAD of the system
+#   copies before `import pycolmap`.
+AUDITWHEEL_EXCLUDES=(
+    # CUDA
     libcuda.so.1
     libcudart.so
     libcublas.so
@@ -84,6 +90,13 @@ CUDA_EXCLUDES=(
     libnppisu.so
     libnppitc.so
     libnpps.so
+    # GL stack — pulled in by SiftGPU's unconditional OpenGL::GL/GLEW link.
+    # Even with GUI_ENABLED=OFF the DT_NEEDED entries remain; we just don't
+    # want auditwheel bundling renamed copies into pycolmap.libs/.
+    libGL.so.1
+    libGLX.so.0
+    libOpenGL.so.0
+    libGLdispatch.so.0
 )
 
 # Read the base version once.
@@ -123,6 +136,10 @@ build_for_cuda() {
     # Config-mode discovery, but this flag also protects COLMAP's own
     # transitive dependency resolution from any future Module-mode finders
     # that re-import the glog::glog target.
+    # GUI_ENABLED=OFF drops Qt entirely and (via FindDependencies.cmake)
+    # force-disables OPENGL_ENABLED. SiftGPU still PRIVATE-links OpenGL/GLEW
+    # unconditionally, so libGL DT_NEEDED entries survive — those are
+    # handled by AUDITWHEEL_EXCLUDES below.
     cmake -S "$REPO_ROOT" -B "$CMAKE_BUILD_DIR" \
         -GNinja \
         -DCMAKE_BUILD_TYPE=Release \
@@ -131,6 +148,7 @@ build_for_cuda() {
         -DCMAKE_CUDA_ARCHITECTURES="$CUDA_ARCH" \
         -DCMAKE_FIND_PACKAGE_PREFER_CONFIG=TRUE \
         -DCMAKE_BUILD_WITH_INSTALL_RPATH=ON \
+        -DGUI_ENABLED=OFF \
         ${BLA_VENDOR:+-DBLA_VENDOR="$BLA_VENDOR"}
     ninja -j"$NJOBS" -C "$CMAKE_BUILD_DIR" install
 
@@ -164,7 +182,8 @@ build_for_cuda() {
 -DCMAKE_CUDA_ARCHITECTURES=$CUDA_ARCH \
 -DCMAKE_CUDA_COMPILER=$NVCC_PATH \
 -DCMAKE_FIND_PACKAGE_PREFER_CONFIG=TRUE \
--DCMAKE_BUILD_WITH_INSTALL_RPATH=ON" \
+-DCMAKE_BUILD_WITH_INSTALL_RPATH=ON \
+-DGUI_ENABLED=OFF" \
     SKBUILD_BUILD_DIR="$STAGE_DIR/scikit" \
     SKBUILD_PROJECT_VERSION="${BASE_VERSION}+${CUDA_LABEL}" \
     LD_LIBRARY_PATH="$INSTALL_DIR/lib64:$INSTALL_DIR/lib:/usr/local/lib64:/usr/local/lib:${LD_LIBRARY_PATH:-}" \
@@ -184,7 +203,7 @@ build_for_cuda() {
     echo "========================================================"
     local EXCLUDE_ARGS=()
     local lib
-    for lib in "${CUDA_EXCLUDES[@]}"; do
+    for lib in "${AUDITWHEEL_EXCLUDES[@]}"; do
         EXCLUDE_ARGS+=(--exclude "$lib")
     done
 
