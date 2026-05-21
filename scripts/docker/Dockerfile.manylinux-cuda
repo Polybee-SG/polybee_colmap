@@ -18,6 +18,11 @@ ENV LANG=C.UTF-8 \
     PYTHONDONTWRITEBYTECODE=1 \
     PYTHONUNBUFFERED=1
 
+# The base image ships a CUDA yum repo whose cached metadata hashes go stale
+# as NVIDIA refreshes their CDN, causing 404s on any dnf operation. CUDA is
+# already installed in the image so we don't need the repo at all.
+RUN rm -f /etc/yum.repos.d/cuda*.repo && dnf clean all
+
 # CRB ("CodeReady Builder", formerly PowerTools) hosts -devel packages for
 # headers like qt5-qtbase-devel, etc. EPEL adds CGAL, flann, freeimage,
 # gflags, suitesparse, etc.

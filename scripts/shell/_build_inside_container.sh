@@ -117,6 +117,30 @@ build_for_cuda() {
         return
     fi
 
+    # Resolve "all"/"all-major" to the semicolon-separated arch list that
+    # this specific nvcc actually supports.  CMake 3.26's internal table
+    # predates CUDA 13 and still lists compute_50 (Maxwell) which CUDA 13
+    # removed; passing the stale value causes a fatal "Unsupported gpu
+    # architecture" error.  Querying nvcc directly is always correct.
+    local RESOLVED_ARCH="$CUDA_ARCH"
+    if [ "$CUDA_ARCH" = "all" ]; then
+        RESOLVED_ARCH=$("$NVCC_PATH" --list-gpu-arch 2>/dev/null \
+            | sed 's/compute_//' \
+            | sort -V \
+            | uniq \
+            | paste -sd';')
+        echo "[INFO] CUDA_ARCH=all resolved by nvcc to: $RESOLVED_ARCH"
+    elif [ "$CUDA_ARCH" = "all-major" ]; then
+        # Major arches only: keep one entry per X0 level (60,70,80,90,…).
+        RESOLVED_ARCH=$("$NVCC_PATH" --list-gpu-arch 2>/dev/null \
+            | sed 's/compute_//' \
+            | grep -E '^[0-9]+$' \
+            | sort -n \
+            | awk 'NR==1 || int($1/10) != int(prev/10) {print; prev=$1}' \
+            | paste -sd';')
+        echo "[INFO] CUDA_ARCH=all-major resolved by nvcc to: $RESOLVED_ARCH"
+    fi
+
     local CUDA_LABEL="cuda${CUDA_VERSION}"
     local STAGE_DIR="$WORK_ROOT/$CUDA_LABEL"
     local CMAKE_BUILD_DIR="$STAGE_DIR/cmake"
@@ -145,7 +169,7 @@ build_for_cuda() {
         -DCMAKE_BUILD_TYPE=Release \
         -DCMAKE_INSTALL_PREFIX="$INSTALL_DIR" \
         -DCMAKE_CUDA_COMPILER="$NVCC_PATH" \
-        -DCMAKE_CUDA_ARCHITECTURES="$CUDA_ARCH" \
+        -DCMAKE_CUDA_ARCHITECTURES="$RESOLVED_ARCH" \
         -DCMAKE_FIND_PACKAGE_PREFER_CONFIG=TRUE \
         -DCMAKE_BUILD_WITH_INSTALL_RPATH=ON \
         -DGUI_ENABLED=OFF \
@@ -179,7 +203,7 @@ build_for_cuda() {
     echo "========================================================"
     CMAKE_ARGS="\
 -Dcolmap_DIR=$INSTALL_DIR/share/colmap \
--DCMAKE_CUDA_ARCHITECTURES=$CUDA_ARCH \
+-DCMAKE_CUDA_ARCHITECTURES=$RESOLVED_ARCH \
 -DCMAKE_CUDA_COMPILER=$NVCC_PATH \
 -DCMAKE_FIND_PACKAGE_PREFER_CONFIG=TRUE \
 -DCMAKE_BUILD_WITH_INSTALL_RPATH=ON \
