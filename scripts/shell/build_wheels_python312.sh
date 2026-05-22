@@ -16,6 +16,9 @@
 #
 #   CUDA_ARCH defaults to 89 (Ada Lovelace / RTX 40xx).
 #   Override for other GPUs, e.g. 80 (Ampere), 86, 75 (Turing).
+#   Pass "all" to target every architecture the installed CUDA toolkit
+#   supports (nvcc-queried at build time — immune to CMake's stale tables).
+#   Pass "all-major" to target only the major generation steps (60,70,80,…).
 #
 # Optional environment overrides:
 #   BLA_VENDOR        — passed to CMake; default Intel10_64lp (MKL)
