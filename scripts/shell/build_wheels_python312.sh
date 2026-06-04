@@ -21,7 +21,7 @@
 #   Pass "all-major" to target only the major generation steps (60,70,80,…).
 #
 # Optional environment overrides:
-#   BLA_VENDOR        — passed to CMake; default Intel10_64lp (MKL)
+#   BLA_VENDOR        — passed to CMake; default Intel10_64_dyn (MKL)
 #   MANYLINUX_PLAT    — auditwheel platform tag; default manylinux_2_34_x86_64
 #   IMAGE_TAG         — name of the build image; default polybee-pycolmap-build:cuda13-py312
 #   REBUILD_IMAGE=1   — force `docker build` even if the image already exists
@@ -30,7 +30,7 @@
 set -euo pipefail
 
 CUDA_ARCH="${1:-89}"
-BLA_VENDOR="${BLA_VENDOR:-Intel10_64lp}"
+BLA_VENDOR="${BLA_VENDOR:-Intel10_64_dyn}"
 MANYLINUX_PLAT="${MANYLINUX_PLAT:-manylinux_2_34_x86_64}"
 IMAGE_TAG="${IMAGE_TAG:-polybee-pycolmap-build:cuda13-py312}"
 
